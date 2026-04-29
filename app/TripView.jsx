@@ -96,11 +96,11 @@ export default function TripView() {
     }, SAVE_DEBOUNCE_MS);
   }
 
-  if (status === "loading") {
-    return <div style={{ padding: 48, color: "var(--muted)" }}>Loading…</div>;
-  }
   if (status === "error" && !trip) {
     return <ConfigError message={error} />;
+  }
+  if (!trip) {
+    return <div style={{ padding: 48, color: "var(--muted)" }}>Loading…</div>;
   }
 
   return (
