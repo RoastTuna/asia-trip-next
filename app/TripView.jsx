@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { supabase, TRIP_ID } from "../lib/supabase";
-import { seedTrip } from "../lib/seed";
+import { seedTrip, ensureShape } from "../lib/seed";
 
 const SAVE_DEBOUNCE_MS = 400;
 
@@ -38,8 +38,13 @@ export default function TripView() {
           setTrip(insert.data.data);
           setChecks(insert.data.checks || {});
         } else {
-          setTrip(data.data);
+          const { trip: shaped, changed } = ensureShape(data.data);
+          setTrip(shaped);
           setChecks(data.checks || {});
+          if (changed) {
+            lastLocalWriteAt.current = Date.now();
+            await supabase.from("trips").update({ data: shaped }).eq("id", TRIP_ID);
+          }
         }
         setStatus("live");
       } catch (e) {
@@ -111,6 +116,11 @@ export default function TripView() {
             <h1>{trip.title}</h1>
             <p className="muted">{trip.subtitle}</p>
             <Countdown firstDate={trip.legs[0]?.date} />
+            <PeopleBar
+              people={trip.people}
+              edit={edit}
+              onChange={(people) => scheduleSave({ ...trip, people })}
+            />
           </div>
           <div className="hero-actions">
             <span className={`status-pill ${status}`}>
@@ -164,6 +174,33 @@ export default function TripView() {
   );
 }
 
+function PeopleBar({ people, edit, onChange }) {
+  if (!people || people.length === 0) return null;
+  function patch(idx, key, value) {
+    const next = people.map((p, i) => (i === idx ? { ...p, [key]: value } : p));
+    onChange(next);
+  }
+  return (
+    <div className="people-bar">
+      {people.map((p, i) => (
+        <span key={p.id} className="person">
+          {edit ? (
+            <>
+              <input type="color" value={p.color} onChange={(e) => patch(i, "color", e.target.value)} />
+              <input type="text" value={p.name} onChange={(e) => patch(i, "name", e.target.value)} />
+            </>
+          ) : (
+            <>
+              <span className="person-swatch" style={{ background: p.color }} />
+              <span>{p.name}</span>
+            </>
+          )}
+        </span>
+      ))}
+    </div>
+  );
+}
+
 function Countdown({ firstDate }) {
   if (!firstDate) return null;
   const days = Math.ceil((new Date(firstDate) - new Date()) / 86400000);
@@ -204,9 +241,12 @@ function Itinerary({ trip, edit, onChange }) {
     const prev = trip.legs[trip.legs.length - 1];
     const from = prev?.to || { name: "", lat: 0, lon: 0 };
     const today = new Date().toISOString().slice(0, 10);
+    const firstPerson = trip.people?.[0]?.id || "shao";
     const newLeg = {
       id: "leg-" + Date.now(),
       type: "flight",
+      participants: [firstPerson],
+      flightNumber: "",
       date: today,
       departTime: "",
       arriveTime: "",
@@ -224,6 +264,7 @@ function Itinerary({ trip, edit, onChange }) {
           <LegCard
             key={leg.id}
             leg={leg}
+            people={trip.people || []}
             edit={edit}
             onPatch={(patch) => update(i, patch)}
             onPatchNested={(k, s, v) => updateNested(i, k, s, v)}
@@ -240,8 +281,18 @@ function Itinerary({ trip, edit, onChange }) {
   );
 }
 
-function LegCard({ leg, edit, onPatch, onPatchNested, onDelete }) {
+function LegCard({ leg, people, edit, onPatch, onPatchNested, onDelete }) {
   const isFlight = leg.type === "flight";
+  const participants = leg.participants || [];
+  const activePeople = people.filter((p) => participants.includes(p.id));
+
+  function toggleParticipant(personId) {
+    const next = participants.includes(personId)
+      ? participants.filter((id) => id !== personId)
+      : [...participants, personId];
+    onPatch({ participants: next });
+  }
+
   return (
     <li>
       <span className={`dot ${isFlight ? "flight" : ""}`} />
@@ -251,9 +302,30 @@ function LegCard({ leg, edit, onPatch, onPatchNested, onDelete }) {
         <div className="what">
           <span className="badge">{leg.type}</span>
           {isFlight ? `${leg.from.name} → ${leg.to.name}` : leg.from.name}
+          {isFlight && leg.flightNumber && (
+            <a
+              className="flight-link"
+              href={`https://www.flightaware.com/live/flight/${encodeURIComponent(leg.flightNumber.replace(/\s+/g, ""))}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              title="Check flight status on FlightAware"
+            >
+              ✈ {leg.flightNumber} ↗
+            </a>
+          )}
         </div>
         {isFlight && leg.departTime && leg.arriveTime && (
           <div className="times">Depart {leg.departTime} → Arrive {leg.arriveTime}</div>
+        )}
+        {activePeople.length > 0 && (
+          <div className="participant-chips">
+            {activePeople.map((p) => (
+              <span key={p.id} className="participant-chip" title={p.name}>
+                <span className="person-swatch" style={{ background: p.color }} />
+                {p.name}
+              </span>
+            ))}
+          </div>
         )}
         {leg.notes && <div className="notes">{leg.notes}</div>}
       </div>
@@ -305,6 +377,33 @@ function LegCard({ leg, edit, onPatch, onPatchNested, onDelete }) {
                 <input type="number" step="0.0001" value={leg.to.lon} onChange={(e) => onPatchNested("to", "lon", parseFloat(e.target.value) || 0)} />
               </label>
             </>
+          )}
+          {isFlight && (
+            <label className="full">Flight number
+              <input
+                type="text"
+                value={leg.flightNumber || ""}
+                placeholder="e.g. BR016"
+                onChange={(e) => onPatch({ flightNumber: e.target.value })}
+              />
+            </label>
+          )}
+          {people.length > 0 && (
+            <label className="full">Who's on this leg
+              <div className="participant-toggles">
+                {people.map((p) => (
+                  <label key={p.id} className="participant-toggle">
+                    <input
+                      type="checkbox"
+                      checked={participants.includes(p.id)}
+                      onChange={() => toggleParticipant(p.id)}
+                    />
+                    <span className="person-swatch" style={{ background: p.color }} />
+                    {p.name}
+                  </label>
+                ))}
+              </div>
+            </label>
           )}
           <label className="full">Notes
             <textarea value={leg.notes || ""} onChange={(e) => onPatch({ notes: e.target.value })} />
@@ -372,10 +471,15 @@ function draw(map, L, trip) {
       points.push([p.lat, p.lon]);
     }
   }
+  const peopleById = Object.fromEntries((trip.people || []).map((p) => [p.id, p]));
   for (const leg of trip.legs.filter((l) => l.type === "flight")) {
     if (leg.from.lat === 0 || leg.to.lat === 0) continue;
+    const parts = leg.participants || [];
+    const color = parts.length === 1 && peopleById[parts[0]]
+      ? peopleById[parts[0]].color
+      : "#c2410c";
     L.polyline([[leg.from.lat, leg.from.lon], [leg.to.lat, leg.to.lon]],
-      { color: "#c2410c", weight: 2, dashArray: "6 6" }).addTo(map);
+      { color, weight: 2, dashArray: "6 6" }).addTo(map);
   }
   if (points.length) map.fitBounds(L.latLngBounds(points), { padding: [40, 40] });
   else map.setView([20, 120], 4);
